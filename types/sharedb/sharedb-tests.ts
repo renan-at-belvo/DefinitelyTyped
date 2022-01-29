@@ -3,6 +3,7 @@ import * as http from 'http';
 import * as WebSocket from 'ws';
 import { Duplex } from 'stream';
 import * as ShareDBClient from 'sharedb/lib/client';
+import Agent = require('sharedb/lib/agent');
 
 // Adapted from https://github.com/avital/websocket-json-stream
 class WebSocketJSONStream extends Duplex {
@@ -42,6 +43,9 @@ const backend = new ShareDB({
     milestoneDb: new MyMilestoneDB(),
     suppressPublish: false,
     maxSubmitRetries: 3,
+    errorHandler: (error, context) => {
+        console.log(error, context.agent.custom);
+    },
 });
 console.log(backend.db);
 backend.on('error', (error) => console.error(error));
@@ -57,14 +61,34 @@ console.log(backend.pubsub);
 console.log(backend.extraDbs);
 
 backend.addProjection('notes_minimal', 'notes', {title: true, creator: true, lastUpdateTime: true});
+const readonlyProjection = backend.projections['notes_minimal'];
+console.log(readonlyProjection.target, readonlyProjection.fields);
+// backend.projections is used by sharedb internally, so they shouldn't be messed with.
+// Test that marking as readonly in API prevents external modification.
+// $ExpectError
+delete backend.projections;
+// $ExpectError
+delete backend.projections.notes_minimal;
+// $ExpectError
+backend.projections['notes_minimal'].target = 'notes2';
+// $ExpectError
+backend.projections['notes_minimal'].fields = {};
+// $ExpectError
+backend.projections['notes_minimal'].fields['title'] = true;
 
 // Exercise middleware (backend.use)
 type SubmitRelatedActions = 'afterWrite' | 'apply' | 'commit' | 'submit';
 const submitRelatedActions: SubmitRelatedActions[] = ['afterWrite', 'apply', 'commit', 'submit'];
 for (const action of submitRelatedActions) {
     backend.use(action, (request, callback) => {
-        if (request.agent.custom.user) {
-            console.log(request.agent.custom.user.id);
+        const agent = request.agent as Agent<{
+            user: {
+                id: string
+            }
+        }>;
+
+        if (agent.custom.user) {
+            console.log(agent.custom.user.id);
         }
         console.log(
             request.action,
@@ -169,6 +193,21 @@ backend.use('readSnapshots', (context, callback) => {
     callback();
 });
 
+backend.use('receivePresence', (context, callback) => {
+    console.log(
+        context.presence.ch,
+        context.presence.id,
+    );
+});
+
+backend.use('sendPresence', (context, callback) => {
+    console.log(
+        context.presence.ch,
+        context.presence.id,
+    );
+    callback();
+});
+
 backend.on('submitRequestEnd', (error, request) => {
     console.log(request.op);
 });
@@ -178,6 +217,10 @@ const agent = connection.agent;
 const netRequest = {};  // Passed through to 'connect' middleware, not used by sharedb itself
 const connectionWithReq = backend.connect(null, netRequest);
 const reboundConnection = backend.connect(backend.connect(), netRequest);
+
+const connectionHasPending: boolean = connection.hasPending();
+connection.whenNothingPending(() => console.log('whenNothingPending resolved'));
+connection.send({ a: 'nonExistentAction', some: 'data' });
 
 const doc = connection.get('examples', 'counter');
 
@@ -323,6 +366,18 @@ function startClient(callback) {
 
     doc.submitOp([{insert: 'foo', attributes: {bold: true}}], {source: {deep: true}});
 
+    doc.on('load', () => {});
+    doc.on('no write pending', () => {});
+    doc.on('nothing pending', () => {});
+    doc.on('create', (source: any) => {});
+    doc.on('op', (ops: [any], source: any, clientId: string) => {});
+    doc.on('op batch', (ops: any[], source: any) => {});
+    doc.on('before op', (ops: [any], source: any, clientId: string) => {});
+    doc.on('before op batch', (ops: any[], source: any) => {});
+    doc.on('del', (data: MyDoc, source: any) => {});
+    doc.on('error', (error: ShareDB.Error) => {});
+    doc.on('destroy', () => {});
+
     connection.fetchSnapshot('examples', 'foo', 123, (error, snapshot: ShareDBClient.Snapshot) => {
         if (error) throw error;
         console.log(snapshot.data);
@@ -332,6 +387,8 @@ function startClient(callback) {
         if (error) throw error;
         console.log(snapshot.data);
     });
+
+    console.log(connection.id + connection.seq);
 
     interface PresenceValue {
         foo: number;
